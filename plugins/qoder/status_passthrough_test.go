@@ -75,13 +75,21 @@ func TestUpstreamStatusErrorPolicy(t *testing.T) {
 	}
 }
 
-// TestNextCheckinTimeSkipsBeforeOpeningHour guards the 10:00 opening-hour
-// fix: from 09:59 the next auto tick must be 10:00, never the stale 09:00.
+// TestNextCheckinTimeSkipsBeforeOpeningHour guards the 10:00 opening-hour fix,
+// now measured on the SCHEDULE clock (Asia/Shanghai by default, see
+// schedule.go): from 09:59 BJT the next tick must be 10:00 BJT, never the
+// stale 09:00 — and the host's own timezone must not move the slot.
 func TestNextCheckinTimeSkipsBeforeOpeningHour(t *testing.T) {
-	loc := time.Local
-	now := time.Date(2026, 9, 20, 9, 59, 0, 0, loc)
-	next := nextCheckinTime(now)
+	setScheduleTimezone("Asia/Shanghai")
+	defer setScheduleTimezone("Asia/Shanghai")
+	bj := scheduleLocation()
+	now := time.Date(2026, 9, 20, 9, 59, 0, 0, bj)
+	next := nextCheckinTime(now).In(bj)
 	if next.Hour() != 10 || next.Day() != now.Day() {
-		t.Fatalf("next = %s, want today 10:00", next)
+		t.Fatalf("next = %s, want today 10:00 BJT", next)
+	}
+	// Same instant handed in as a UTC time must resolve to the same slot.
+	if viaUTC := nextCheckinTime(now.UTC()).In(bj); !viaUTC.Equal(next) {
+		t.Fatalf("host timezone changed the slot: %s vs %s", viaUTC, next)
 	}
 }

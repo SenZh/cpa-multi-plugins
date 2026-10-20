@@ -285,23 +285,26 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 	}
 
 	prompt := extractLatestUserPrompt(req.Messages)
-	// Issue #37: the QoderWork agent_chat_generation body has NO image field
-	// — the only channels are chat_context.text (the prompt string) and the
-	// messages passthrough, which the upstream gateway flattens to text.
-	// image_url parts therefore cannot reach the model: image-only requests
-	// used to die with the misleading "no user message in request", and
-	// mixed content silently lost the image while the model answered as if
-	// it had considered it. Both now fail explicitly and honestly; the fix
-	// is deliberately a plain error (no StatusCode) so no host version can
-	// re-read it as a credential-level failure — the request shape is the
-	// problem, not the account.
-	if n := latestUserImageParts(req.Messages); n > 0 {
+	// Issue #37 + its 2026-10-20 follow-up (image_input.go): image_url parts
+	// ride the messages passthrough untouched. That is dialect A of
+	// qoder_live_image_test.go, verified against the live CN gateway —
+	// inline data URIs, image-only turns and 1.6MB screenshots all reached
+	// the model with exact OCR readback. The v0.8.66 unconditional rejection
+	// is therefore a *configurable* fallback (image_forward: false), not the
+	// default: it stays available for realms where the image would be
+	// silently ignored.
+	nImages := latestUserImageParts(req.Messages)
+	if nImages > 0 && !imageForwardEnabled() {
 		return nil, fmt.Errorf(
 			"qoder 通道不支持图像输入（上游 agent_chat_generation 请求体没有图像字段）：最新用户消息携带 %d 个 image_url 部分，无法转发到上游——纯图像消息与图文混排同样会被拒绝；请将视觉请求路由到支持图像输入的提供商/模型。"+
 				" // The qoder channel is text-only (the upstream agent_chat_generation body carries no image field): the latest user message carries %d image_url part(s) that cannot be forwarded — image-only and mixed content are both rejected; route vision requests to a vision-capable provider.",
-			n, n)
+			nImages, nImages)
 	}
-	if prompt == "" {
+	// An image-only turn carries no text at all; upstream renders it fine
+	// (verified: empty chat_context.text + a lone image_url part answered with
+	// the image contents), so the empty-prompt error only applies to
+	// text-less, image-less requests.
+	if prompt == "" && nImages == 0 {
 		return nil, fmt.Errorf("no user message in request")
 	}
 
@@ -410,7 +413,14 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 	if biz, ok := base["business"].(map[string]any); ok {
 		biz["id"] = uuid.NewString()
 		biz["begin_at"] = time.Now().UnixMilli()
-		biz["name"] = runeSafePrefix(prompt, 30)
+		// business.name is the session title; an image-only turn has no text
+		// to name it after, and an empty title is not a shape the upstream
+		// client ever sends.
+		nameForBiz := prompt
+		if nameForBiz == "" {
+			nameForBiz = "[image]"
+		}
+		biz["name"] = runeSafePrefix(nameForBiz, 30)
 	}
 
 	// Reasoning dial: inject upstream thinking parameters only when the client

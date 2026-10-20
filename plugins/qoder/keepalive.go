@@ -305,8 +305,11 @@ func runTokenKeepalive() *keepaliveSummary {
 // one hour after any scheduled keepalive hour today. Used by schedulerLoop
 // to fire keepalive on the same tick as checkin when the schedules coincide.
 func shouldRunKeepaliveNow(now time.Time) bool {
+	// Same clock as the check-in schedule (default Asia/Shanghai) — see schedule.go.
+	loc := scheduleLocation()
+	now = now.In(loc)
 	for _, h := range keepaliveHours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, loc)
 		// Within [t, t+1h) window.
 		if !now.Before(t) && now.Before(t.Add(time.Hour)) {
 			return true

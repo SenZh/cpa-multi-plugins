@@ -17,6 +17,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -46,13 +47,18 @@ func ensureScheduler() {
 
 func nextCheckinTime(now time.Time) time.Time {
 	var earliest time.Time
+	// Schedule slots are interpreted in the SCHEDULE timezone (default
+	// Asia/Shanghai), never the host's local zone: the host is usually UTC and
+	// the upstream's daily round refreshes at 10:00 Beijing (see schedule.go).
+	loc := scheduleLocation()
+	now = now.In(loc)
 	// Consider both checkin and keepalive schedules so the timer wakes up for
 	// whichever fires first (e.g. 21:00 checkin vs 22:00 keepalive → 21:00 wins,
 	// then 22:00 keepalive fires on the next tick).
 	hours := append([]int{}, checkinHours...)
 	hours = append(hours, keepaliveHours...)
 	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, loc)
 		if !t.After(now) {
 			t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
 		}
@@ -64,8 +70,16 @@ func nextCheckinTime(now time.Time) time.Time {
 }
 
 func schedulerLoop(stop chan struct{}) {
+	armed := false
 	for {
 		next := nextCheckinTime(time.Now())
+		if !armed {
+			// 一次性日志：让"自动签到到底跑没跑、下次什么时候"在 journal 里可见。
+			log.Printf("qoder: scheduler armed — next tick %s (tz=%s, UTC now %s)",
+				next.Format("2006-01-02 15:04 MST"), scheduleLocation(),
+				time.Now().UTC().Format("2006-01-02 15:04"))
+			armed = true
+		}
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-stop:
@@ -100,15 +114,28 @@ func runAutoCheckin() {
 	}
 	files, err := hostAuthList()
 	if err != nil {
+		log.Printf("qoder checkin: scheduled tick skipped, auth list failed: %v", err)
 		return
 	}
+	log.Printf("qoder checkin: scheduled tick start — %d account(s), tz=%s, now=%s",
+		len(files), scheduleLocation(), scheduleNow().Format("2006-01-02 15:04 MST"))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
+	// 逐账号抖动：三个号同一秒打同一个 claim 接口最容易吃 9074（"当前参与
+	// 用户太多"）。窗口由 checkin_jitter_minutes 控制（默认 15 分钟，0 关闭）。
+	// 抖动发生在拿并发槽之前——等待中的账号不占并发名额。
+	jitterWindow := checkinJitterWindow()
 	for _, f := range files {
 		f := f
+		offset := jitterFor(jitterWindow)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if offset > 0 {
+				log.Printf("qoder checkin: %s scheduled with jitter %s (target %s)",
+					f.Name, offset.Truncate(time.Second), scheduleNow().Add(offset).Format("15:04:05"))
+				time.Sleep(offset)
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			processAutoCheckinAccount(f, doCheckin)
@@ -169,7 +196,23 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 		// performCheckinCall owns the verdict now.
 		ci, err := fetchCheckinStatus(sa)
 		if err == nil && ci != nil && !ci.TodayCheckedIn {
-			if _, callErr := checkinWithWindowRetry(sa); callErr == nil {
+			who := f.AuthIndex
+			if sa.Account.Nickname != "" {
+				who = sa.Account.Nickname
+			}
+			res, callErr := checkinWithWindowRetry(sa)
+			switch {
+			case callErr != nil:
+				log.Printf("qoder checkin: %s tick claim error: %v", who, callErr)
+			case checkinRateLimitedRes(res):
+				// 9074/10605: 上游限流，当天还有机会——后台退避重试，不拖住 tick。
+				log.Printf("qoder checkin: %s rate-limited at tick (%s), scheduling backoff retries",
+					who, summarizeCheckinClaimRes(res))
+				retryRateLimitedCheckinAsync(f.AuthIndex, f.ID, who, sa)
+			default:
+				log.Printf("qoder checkin: %s tick verdict: %s", who, summarizeCheckinClaimRes(res))
+			}
+			if callErr == nil {
 				// v0.8.8: 记录签到时刻（与手动签到一致），让紧随
 				// 其后的 reconcile 处于 lifecycle 宽限窗口内。
 				rememberCheckinMoment(f.ID)
@@ -194,6 +237,8 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 					}
 				}
 			}
+		} else if err == nil && ci != nil && ci.TodayCheckedIn {
+			log.Printf("qoder checkin: %s already checked in today", f.AuthIndex)
 		}
 		// Refresh cache with latest checkin status (merge, don't wipe credits/plan).
 		if ci != nil {

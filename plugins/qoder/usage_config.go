@@ -116,6 +116,9 @@ func configure(raw []byte) {
 	nextStreamHeadTimeout := 0
 	nextClaimUnverified := false
 	nextRoundSeeds := ""
+	nextImageForward := defaultImageForward
+	nextScheduleTZ := ""
+	nextJitterMinutes := defaultCheckinJitterMinutes
 
 	cfgURL, cfgKey := "", ""
 	if len(raw) > 0 {
@@ -169,6 +172,17 @@ func configure(raw []byte) {
 				}
 				if v, present := m["checkin_round_seeds"]; present {
 					nextRoundSeeds = configScalarString(v)
+				}
+				if v, present := m["image_forward"]; present {
+					nextImageForward = configScalarBool(v)
+				}
+				if v, present := m["schedule_timezone"]; present {
+					nextScheduleTZ = configScalarString(v)
+				}
+				if v, present := m["checkin_jitter_minutes"]; present {
+					if mins, errParse := strconv.Atoi(configScalarString(v)); errParse == nil {
+						nextJitterMinutes = mins
+					}
 				}
 			}
 			for _, line := range strings.Split(string(req.ConfigYAML), "\n") {
@@ -235,6 +249,11 @@ func configure(raw []byte) {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_round_seeds:"))
 					nextRoundSeeds = strings.Trim(v, "\"'")
 				}
+				if strings.HasPrefix(line, "image_forward:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "image_forward:"))
+					v = strings.Trim(v, "\"'")
+					nextImageForward = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
 			}
 		}
 	}
@@ -282,6 +301,16 @@ func configure(raw []byte) {
 	claimUnverifiedMu.Unlock()
 
 	applyRoundSeeds(nextRoundSeeds)
+
+	// image_forward: not sticky the other way round — an explicit false must
+	// win, and a bare reconfigure resets to the shipped default.
+	setImageForward(nextImageForward)
+
+	// schedule_timezone: 只有显式配置才移动调度时钟（默认 Asia/Shanghai）。
+	setScheduleTimezone(nextScheduleTZ)
+
+	// checkin_jitter_minutes: 裸 reconfigure 回到默认 15 分钟。
+	setCheckinJitterMinutes(nextJitterMinutes)
 
 	setStreamHeadTimeout(nextStreamHeadTimeout)
 

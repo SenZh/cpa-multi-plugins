@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -9,8 +10,15 @@ import (
 // Issue #37 (onlyjco): image_url content parts were silently dropped while
 // flattening content — image-only requests died with the misleading
 // "no user message in request", mixed content returned 200 while the model
-// answered "I don't see any image". The channel is text-only; both shapes
-// now fail explicitly.
+// answered "I don't see any image". v0.8.66 turned both into an explicit
+// rejection. The 2026-10-20 CN live matrix (see image_input.go) showed the
+// drop was an Intl-realm artifact: the very passthrough that "silently lost"
+// the parts delivers pixels on the CN gateway. Contract now:
+//
+//	image_forward: true  (default) → image parts ride along, no error
+//	image_forward: false          → v0.8.66 honest rejection
+//
+// These tests pin both halves.
 
 // imageOnlyMessages reproduces Repro A: a single user message carrying only
 // an image_url part.
@@ -36,32 +44,91 @@ func unmarshalMessages(t *testing.T, raw string) []openAIMessage {
 	return msgs
 }
 
-func TestBuildQoderBodyRejectsImageOnly(t *testing.T) {
-	// Repro A used to fail with "body build: no user message in request" —
-	// the honest vision error must replace it.
-	_, err := buildQoderBody(&openAIRequest{Model: "qfmodel", Messages: imageOnlyMessages(t)}, "qfmodel", "default")
-	if err == nil {
-		t.Fatal("image-only request must fail")
+// TestBuildQoderBodyForwardsImageOnly: an image-only turn must reach the body
+// builder (it used to fail with "no user message in request"), and the data
+// URI must survive into the forwarded messages.
+func TestBuildQoderBodyForwardsImageOnly(t *testing.T) {
+	setImageForward(true)
+	defer setImageForward(true)
+	raw, err := buildQoderBody(&openAIRequest{Model: "qfmodel", Messages: imageOnlyMessages(t)}, "qfmodel", "default")
+	if err != nil {
+		t.Fatalf("image-only request must be forwarded: %v", err)
 	}
-	if strings.Contains(err.Error(), "no user message in request") {
-		t.Fatalf("misleading legacy error must be replaced: %v", err)
+	if !strings.Contains(string(raw), "data:image/png;base64,AAAA") {
+		t.Fatal("image part must ride along in the messages payload")
 	}
-	for _, marker := range []string{"image_url", "text-only", "image", "qoder"} {
-		if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(marker)) {
-			t.Fatalf("error copy must name the %q limitation: %v", marker, err)
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if biz, ok := body["business"].(map[string]any); ok {
+		if name, _ := biz["name"].(string); name == "" {
+			t.Fatal("image-only turn needs a non-empty business.name")
 		}
 	}
 }
 
-func TestBuildQoderBodyRejectsMixedContent(t *testing.T) {
-	// Repro B: silent loss → explicit rejection.
-	_, err := buildQoderBody(&openAIRequest{Model: "qfmodel", Messages: mixedMessages(t)}, "qfmodel", "default")
-	if err == nil {
-		t.Fatal("mixed text+image request must fail explicitly, not silently drop the image")
+// TestBuildQoderBodyForwardsMixed: text+image keeps both the prompt text and
+// the image part.
+func TestBuildQoderBodyForwardsMixed(t *testing.T) {
+	setImageForward(true)
+	defer setImageForward(true)
+	raw, err := buildQoderBody(&openAIRequest{Model: "qfmodel", Messages: mixedMessages(t)}, "qfmodel", "default")
+	if err != nil {
+		t.Fatalf("mixed content must be forwarded: %v", err)
 	}
-	if !strings.Contains(err.Error(), "image_url") {
-		t.Fatalf("error must name image_url: %v", err)
+	s := string(raw)
+	if !strings.Contains(s, "describe this") || !strings.Contains(s, "data:image/png;base64,BBBB") {
+		t.Fatalf("mixed content lost a part: %s", s[:min(len(s), 400)])
 	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	cc, _ := body["chat_context"].(map[string]any)
+	txt, _ := cc["text"].(map[string]any)
+	if got, _ := txt["text"].(string); got != "describe this" {
+		t.Fatalf("chat_context.text must stay the text part, got %q", got)
+	}
+}
+
+// TestBuildQoderBodyRejectsImagesWhenForwardDisabled pins the opt-out.
+func TestBuildQoderBodyRejectsImagesWhenForwardDisabled(t *testing.T) {
+	setImageForward(false)
+	defer setImageForward(true)
+	for name, msgs := range map[string][]openAIMessage{
+		"image-only": imageOnlyMessages(t),
+		"mixed":      mixedMessages(t),
+	} {
+		_, err := buildQoderBody(&openAIRequest{Model: "qfmodel", Messages: msgs}, "qfmodel", "default")
+		if err == nil {
+			t.Fatalf("%s: image request must fail when image_forward=false", name)
+		}
+		for _, marker := range []string{"image_url", "text-only"} {
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(marker)) {
+				t.Fatalf("%s: error copy must name the %q limitation: %v", name, marker, err)
+			}
+		}
+	}
+}
+
+// TestImageForwardDefaultsOn: a bare reconfigure (no image_forward key) must
+// restore the shipped default rather than keeping a previously configured off.
+func TestImageForwardDefaultsOn(t *testing.T) {
+	setImageForward(false)
+	// pluginapi.ConfigYAML is a []byte field, so the lifecycle payload carries
+	// it base64-encoded — mirror that here.
+	bare := base64.StdEncoding.EncodeToString([]byte("checkin_auto: false"))
+	configure([]byte(`{"config_yaml":"` + bare + `"}`))
+	if !imageForwardEnabled() {
+		t.Fatal("bare reconfigure must reset image_forward to the default (true)")
+	}
+	off := base64.StdEncoding.EncodeToString([]byte("image_forward: false"))
+	configure([]byte(`{"config_yaml":"` + off + `"}`))
+	if imageForwardEnabled() {
+		t.Fatal("explicit image_forward: false must be honored")
+	}
+	setImageForward(true)
 }
 
 func TestBuildQoderBodyPlainAndStructuredTextStillWork(t *testing.T) {
@@ -81,12 +148,20 @@ func TestBuildQoderBodyPlainAndStructuredTextStillWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("text-only structured content must keep working: %v", err)
 	}
+	// A request with neither text nor images still fails honestly.
+	_, err = buildQoderBody(&openAIRequest{
+		Model:    "qfmodel",
+		Messages: unmarshalMessages(t, `[{"role":"system","content":"sys"}]`),
+	}, "qfmodel", "default")
+	if err == nil || !strings.Contains(err.Error(), "no user message") {
+		t.Fatalf("text-less, image-less request must fail: %v", err)
+	}
 }
 
 func TestBuildQoderBodyHistoryImagesNotRetroactive(t *testing.T) {
-	// An old screenshot in the HISTORY must not fail every follow-up turn —
-	// the guard is scoped to the LATEST user message (history parts were
-	// already forwarded-and-ignored upstream before the guard existed).
+	// An old screenshot in the HISTORY must not fail every follow-up turn.
+	setImageForward(false)
+	defer setImageForward(true)
 	msgs := unmarshalMessages(t, `[`+
 		`{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,OLD"}}]},`+
 		`{"role":"assistant","content":"cannot see images"},`+
@@ -130,7 +205,7 @@ func TestLatestUserImagePartCounters(t *testing.T) {
 }
 
 func TestExtractLatestUserPromptUnchanged(t *testing.T) {
-	// The vision guard must not change text extraction itself.
+	// The image gate must not change text extraction itself.
 	msgs := mixedMessages(t)
 	if got := extractLatestUserPrompt(msgs); got != "describe this" {
 		t.Fatalf("prompt extraction regressed: %q", got)
